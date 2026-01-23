@@ -33,3 +33,34 @@ A Python tool that crawls hotel/property websites and identifies broken virtual 
                         - - Redirects To (where it actually goes)
                           - - Status (GOOD or BAD)
                             - - Timestamp
+
+
+## Features
+
+- **Multi-Method Detection**: Detects virtual tours using 4 different methods:
+-   - Static direct links (href attributes)
+    -   - Data attribute links (data-link attributes)
+        -   - Dynamic JavaScript-rendered modals and iframes
+            -   - Static iframe embeds
+             
+                - - **Two-Tier Crawl Strategy**: Intelligently crawls websites without wasting time on irrelevant pages:
+                  -   - **Tier 1 (Shallow)**: Crawls 1 page from each category to catch featured tours
+                      -   - **Tier 2 (Deep)**: Crawls up to 20 pages of tour-relevant categories only
+                       
+                          - - **Browser Automation**: Uses Selenium WebDriver for JavaScript-heavy sites where tours are dynamically loaded
+                           
+                            - - **Google Sheets Integration**: Automatically exports results to a Google Sheets spreadsheet for analysis and reporting
+                             
+                              - - **Comprehensive Coverage**: Tours can appear on homepages, dining pages, visitor information sections - not just obvious locations
+                               
+                                - ## Crawl Strategy Details
+                               
+                                - See [CRAWL_STRATEGY.md](./CRAWL_STRATEGY.md) for detailed information about how the tool intelligently crawls websites while avoiding irrelevant pages like blogs, press releases, and career pages.
+                               
+                                - ## Advanced Configuration
+                               
+                                - The tool automatically:
+                                - - Enables browser automation by default for JavaScript-heavy sites
+                                  - - Filters out URLs containing: blog, news, press, career, job, contact, policy, privacy, terms, sitemap, logout, login
+                                    - - Tests redirects to determine if they're GOOD (go to /media/ or /properties/) or BAD (go elsewhere)
+                                      - - Captures tour location (which page/section) and redirect destination for complete audit trail
