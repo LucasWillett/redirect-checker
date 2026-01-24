@@ -79,31 +79,50 @@ except Exception as e:
 
         return tours
 
-    def check_redirects(self, urls):
-                  """Check where each URL redirects to."""
+def check_redirects(self, urls):
+                  """Check where each URL redirects to using Playwright."""
         results = []
 
-        for original_url in urls:
-                          try:
-                                                response = self.session.head(original_url, allow_redirects=True, timeout=10)
-                final_url = response.url
+        try:
+                              from playwright.sync_api import sync_playwright
 
-                if '/media' in final_url.lower() or 'visitingmedia' in final_url.lower() or 'matterport' in final_url.lower():
-                                          status = 'GOOD'
+            with sync_playwright() as p:
+                                      browser = p.chromium.launch(headless=True)
+
+                for original_url in urls:
+                                              try:
+                                                                                page = browser.new_page()
+                                                                                # Navigate with a reasonable timeout (15 seconds)
+                        response = page.goto(original_url, wait_until='domcontentloaded', timeout=15000)
+
+                        # Wait a short time for any JS redirects
+                        import time
+                        time.sleep(1)
+
+                        final_url = page.url
+                        page.close()
+
+                        # Check if final URL is on visitingmedia domain
+                        if 'visitingmedia.com' in final_url.lower():
+                                                              status = 'GOOD'
 else:
-                    status = 'BAD'
+                            status = 'BAD'
 
-                results.append({
-                                          'original_url': original_url,
-                                          'final_url': final_url,
-                                          'status': status
-                })
+                        results.append({
+                                                              'original_url': original_url,
+                                                              'final_url': final_url,
+                                                              'status': status
+                        })
 except Exception as e:
-                results.append({
-                                          'original_url': original_url,
-                                          'final_url': 'ERROR',
-                                          'status': 'ERROR'
-                })
+                        results.append({
+                                                              'original_url': original_url,
+                                                              'final_url': 'TIMEOUT/ERROR',
+                                                              'status': 'ERROR'
+                        })
+
+                browser.close()
+except Exception as e:
+            print(f"Error checking redirects: {str(e)}")
 
         return results
 
