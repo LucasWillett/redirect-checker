@@ -80,7 +80,7 @@ except Exception as e:
         return tours
 
 def check_redirects(self, urls):
-                  """Check where each URL redirects to using Playwright."""
+                  """Check where each URL redirects to by tracking responses."""
         results = []
 
         try:
@@ -92,21 +92,30 @@ def check_redirects(self, urls):
                 for original_url in urls:
                                               try:
                                                                                 page = browser.new_page()
-                                                                                # Navigate with a reasonable timeout (15 seconds)
-                        response = page.goto(original_url, wait_until='domcontentloaded', timeout=15000)
 
-                        # Wait a short time for any JS redirects
+                        # Track all responses to detect redirect chain
+                        responses = []
+                        page.on("response", lambda resp: responses.append(resp.url))
+
+                        # Navigate with a reasonable timeout
+                        page.goto(original_url, wait_until='domcontentloaded', timeout=15000)
+
+                        # Wait for JS redirects
                         import time
-                        time.sleep(1)
+                        time.sleep(2)
 
+                        # Get final URL from responses or page.url
                         final_url = page.url
                         page.close()
 
-                        # Check if final URL is on visitingmedia domain
-                        if 'visitingmedia.com' in final_url.lower():
+                        # Check the final URL - if it's NOT visitingmedia, it's a redirect
+                        # Hash fragments stay on same domain, so must look at actual page URL changes
+                        if 'visitingmedia.com' in final_url.lower() and 'truetour' not in final_url.lower():
                                                               status = 'GOOD'
-else:
+elif 'truetour' in final_url.lower() or 'truetour' in str(responses).lower():
                             status = 'BAD'
+else:
+                            status = 'GOOD'  # Default to good if on visitingmedia
 
                         results.append({
                                                               'original_url': original_url,
@@ -116,7 +125,7 @@ else:
 except Exception as e:
                         results.append({
                                                               'original_url': original_url,
-                                                              'final_url': 'TIMEOUT/ERROR',
+                                                              'final_url': 'ERROR',
                                                               'status': 'ERROR'
                         })
 
