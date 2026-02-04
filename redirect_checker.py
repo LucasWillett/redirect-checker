@@ -358,7 +358,10 @@ class RedirectChecker:
             # Create a new page for redirect checking to not interfere with crawling
             redirect_page = self.context.new_page()
             try:
-                redirect_page.goto(url, wait_until='domcontentloaded', timeout=15000)
+                # Use networkidle to wait for JS to finish loading/redirecting
+                redirect_page.goto(url, wait_until='networkidle', timeout=30000)
+                # Extra wait for JS hash-based routing redirects
+                time.sleep(3)
                 final_url = redirect_page.url
             finally:
                 redirect_page.close()
