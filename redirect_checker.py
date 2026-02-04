@@ -389,11 +389,8 @@ class RedirectChecker:
         except Exception as e:
             print(f"\nCould not write to Google Sheets: {str(e)}")
 
-def main():
-    print("="*60)
-    print("REDIRECT CHECKER - TOUR LINK VALIDATOR")
-    print("="*60)
-
+def run_single_mode(credentials_path, output_sheet_id):
+    """Run checker on a single URL (interactive mode)"""
     website_url = input("\nEnter property URL: ").strip()
     website_name = input("Enter property name: ").strip()
     max_pages_input = input("Max pages (default 100): ").strip()
@@ -415,13 +412,152 @@ def main():
         except:
             pass
 
-    sheet_id = '18UAf2hhgdS0-tjADyEkRXCPqksGDYPYA67Hd9MYJX1I'
-    credentials_path = '/Users/lucaswillett/credentials.json'
-
-    checker = RedirectChecker(website_url, sheet_id=sheet_id, credentials_path=credentials_path)
+    checker = RedirectChecker(website_url, sheet_id=output_sheet_id, credentials_path=credentials_path)
     checker.crawl_website(website_url, website_name, max_pages=max_pages)
     checker.save_results()
+
+
+def run_batch_mode(credentials_path, input_sheet_id, output_sheet_id, max_pages=10, start_row=1, row_limit=None):
+    """Run checker on multiple URLs from a Google Sheet
+
+    Expected input sheet format:
+    - Column A: Property name
+    - Column B: URL 1 (required)
+    - Column C: URL 2 (optional)
+    - Column D: URL 3 (optional)
+
+    Args:
+        start_row: Row number to start from (1-indexed, after header)
+        row_limit: Max number of properties to process (None = all)
+    """
+    print("\nBatch mode: Reading properties from Google Sheet...")
+
+    # Connect to Google Sheets
+    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+    creds = ServiceAccountCredentials.from_json_keyfile_name(credentials_path, scope)
+    client = gspread.authorize(creds)
+
+    # Read input sheet
+    input_sheet = client.open_by_key(input_sheet_id)
+    input_worksheet = input_sheet.sheet1
+    all_rows = input_worksheet.get_all_values()
+
+    # Skip header row if present
+    header_offset = 0
+    if all_rows and all_rows[0][0].lower() in ['property', 'name', 'property name', 'hotel', 'account name', 'account']:
+        header_offset = 1
+        print(f"Detected header row, skipping")
+
+    # Calculate which rows to process
+    data_rows = all_rows[header_offset:]
+    total_rows = len(data_rows)
+
+    # Apply start_row (1-indexed from user perspective)
+    actual_start = max(0, start_row - 1)
+    data_rows = data_rows[actual_start:]
+
+    # Apply row limit
+    if row_limit:
+        data_rows = data_rows[:row_limit]
+
+    print(f"Total properties in sheet: {total_rows}")
+    print(f"Processing rows {actual_start + 1} to {actual_start + len(data_rows)}")
+    print(f"Properties to process: {len(data_rows)}\n")
+
+    # Create checker with output sheet
+    # Use a dummy base_url since we'll be processing multiple
+    checker = RedirectChecker("https://example.com", sheet_id=output_sheet_id, credentials_path=credentials_path)
+
+    # Process each property
+    for i, row in enumerate(data_rows):
+        if len(row) < 2:
+            continue
+
+        property_name = row[0].strip() if row[0] else f"Property {i+1}"
+
+        # Get URLs from columns B, C, D (indices 1, 2, 3)
+        urls = []
+        for col_idx in [1, 2, 3]:
+            if col_idx < len(row) and row[col_idx].strip():
+                url = row[col_idx].strip()
+                if not url.startswith(('http://', 'https://')):
+                    url = 'https://' + url
+                urls.append(url)
+
+        if not urls:
+            print(f"[{i+1}/{len(data_rows)}] {property_name}: No URLs found, skipping")
+            continue
+
+        print(f"\n{'='*60}")
+        print(f"[{i+1}/{len(data_rows)}] {property_name}")
+        print(f"URLs to check: {len(urls)}")
+        print(f"{'='*60}")
+
+        # Process each URL for this property
+        for url in urls:
+            checker.base_url = url
+            checker.base_domain = urlparse(url).netloc
+            checker.crawl_path = checker._extract_crawl_path(url)
+            checker.visited_urls = set()  # Reset for each URL
+            checker.crawl_website(url, property_name, max_pages=max_pages)
+
+        # Small delay between properties to avoid rate limits
+        time.sleep(1)
+
+    # Save all results at the end
+    checker.save_results()
+
+
+def main():
+    print("="*60)
+    print("REDIRECT CHECKER - TOUR LINK VALIDATOR")
+    print("="*60)
+
+    credentials_path = '/Users/lucaswillett/credentials.json'
+    output_sheet_id = '18UAf2hhgdS0-tjADyEkRXCPqksGDYPYA67Hd9MYJX1I'
+
+    print("\nModes:")
+    print("  1. Single URL (interactive)")
+    print("  2. Batch process from Google Sheet")
+
+    mode = input("\nSelect mode (1 or 2): ").strip()
+
+    if mode == '2':
+        input_sheet_id = input("Enter input Google Sheet ID (or press Enter for default): ").strip()
+        if not input_sheet_id:
+            # Default to the sheet the user mentioned
+            input_sheet_id = '1zZfUW4qonN21eSo6PeckzweRFlPSHo4CBznGcVpfWtA'
+
+        start_row_input = input("Start from row # (default 1): ").strip()
+        start_row = 1
+        if start_row_input:
+            try:
+                start_row = int(start_row_input)
+            except:
+                pass
+
+        row_limit_input = input("Max properties to process (default all): ").strip()
+        row_limit = None
+        if row_limit_input:
+            try:
+                row_limit = int(row_limit_input)
+            except:
+                pass
+
+        max_pages_input = input("Max pages per URL (default 10): ").strip()
+        max_pages = 10
+        if max_pages_input:
+            try:
+                max_pages = int(max_pages_input)
+            except:
+                pass
+
+        run_batch_mode(credentials_path, input_sheet_id, output_sheet_id, max_pages, start_row, row_limit)
+    else:
+        run_single_mode(credentials_path, output_sheet_id)
+
     print("\nDone!")
+
 
 if __name__ == '__main__':
     main()
