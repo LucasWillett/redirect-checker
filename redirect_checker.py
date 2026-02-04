@@ -21,10 +21,16 @@ class RedirectChecker:
         self.sheet_id = sheet_id
         self.credentials_path = credentials_path
         self.sheets_client = None
+        self.worksheet = None
         self.playwright = None
         self.browser = None
         self.page = None
         self.manual_review_sites = []  # Sites that appear to block automation
+        self.properties_processed = 0
+        self.total_good = 0
+        self.total_bad = 0
+        self.total_errors = 0
+        self.last_sheet_row = 2  # Track last written row (after header)
 
         if sheet_id and credentials_path:
             self._init_sheets()
@@ -38,6 +44,75 @@ class RedirectChecker:
         except Exception as e:
             print(f"Could not connect to Google Sheets: {str(e)}")
             self.sheets_client = None
+
+    def _init_output_sheet(self):
+        """Initialize output sheet with headers for incremental writing"""
+        if not self.sheets_client or not self.sheet_id:
+            return
+        try:
+            sheet = self.sheets_client.open_by_key(self.sheet_id)
+            self.worksheet = sheet.sheet1
+            self.worksheet.clear()
+            # Write headers
+            headers = ['Property Name', 'Original URL', 'Page Found On', 'Redirects To', 'Status', 'Timestamp']
+            self.worksheet.append_row(headers)
+            self.last_sheet_row = 2
+            print("Output sheet initialized")
+        except Exception as e:
+            print(f"Could not initialize output sheet: {str(e)}")
+
+    def _append_to_sheet(self, results_to_add):
+        """Append new problem results to the sheet incrementally"""
+        if not self.worksheet:
+            return
+        try:
+            # Only add BAD REDIRECT, ERROR results
+            problem_results = [r for r in results_to_add if r['status'] in ['BAD REDIRECT', 'ERROR']]
+            for result in problem_results:
+                row = [
+                    result['website_name'],
+                    result['original_url'],
+                    result['page_url'],
+                    result['redirects_to'],
+                    result['status'],
+                    result['timestamp']
+                ]
+                self.worksheet.append_row(row)
+                self.last_sheet_row += 1
+        except Exception as e:
+            print(f"Could not append to sheet: {str(e)}")
+
+    def _update_sheet_summary(self):
+        """Update the summary in the sheet (adds blocked sites at the end)"""
+        if not self.worksheet:
+            return
+        try:
+            # Add blocked sites
+            if self.manual_review_sites:
+                self.worksheet.append_row([])
+                self.worksheet.append_row(['--- BLOCKED SITES (Manual Review) ---', '', '', '', '', ''])
+                for site in self.manual_review_sites:
+                    self.worksheet.append_row([
+                        site['website_name'],
+                        site['url'],
+                        '',
+                        site['reason'],
+                        'BLOCKED',
+                        site['timestamp']
+                    ])
+
+            # Add summary at the bottom
+            self.worksheet.append_row([])
+            self.worksheet.append_row([
+                f'SUMMARY: {self.properties_processed} properties processed',
+                f'GOOD: {self.total_good}',
+                f'BAD: {self.total_bad}',
+                f'ERRORS: {self.total_errors}',
+                f'BLOCKED: {len(self.manual_review_sites)}',
+                datetime.now().isoformat()
+            ])
+        except Exception as e:
+            print(f"Could not update sheet summary: {str(e)}")
 
     def _init_browser(self):
         """Initialize Playwright browser"""
@@ -493,6 +568,9 @@ def run_batch_mode(credentials_path, input_sheet_id, output_sheet_id, max_pages=
     # Use a dummy base_url since we'll be processing multiple
     checker = RedirectChecker("https://example.com", sheet_id=output_sheet_id, credentials_path=credentials_path)
 
+    # Initialize output sheet with headers
+    checker._init_output_sheet()
+
     # Process each property
     for i, row in enumerate(data_rows):
         if len(row) < 2:
@@ -518,6 +596,9 @@ def run_batch_mode(credentials_path, input_sheet_id, output_sheet_id, max_pages=
         print(f"URLs to check: {len(urls)}")
         print(f"{'='*60}")
 
+        # Track results before this property
+        results_before = len(checker.results)
+
         # Process each URL for this property
         for url in urls:
             checker.base_url = url
@@ -526,10 +607,30 @@ def run_batch_mode(credentials_path, input_sheet_id, output_sheet_id, max_pages=
             checker.visited_urls = set()  # Reset for each URL
             checker.crawl_website(url, property_name, max_pages=max_pages)
 
+        # Get new results from this property
+        new_results = checker.results[results_before:]
+
+        # Update running totals
+        checker.properties_processed += 1
+        for r in new_results:
+            if r['status'] == 'GOOD':
+                checker.total_good += 1
+            elif r['status'] == 'BAD REDIRECT':
+                checker.total_bad += 1
+            elif r['status'] == 'ERROR':
+                checker.total_errors += 1
+
+        # Append any problems to sheet immediately
+        checker._append_to_sheet(new_results)
+
+        # Print running totals
+        print(f"  >> Running totals: {checker.properties_processed} properties | GOOD: {checker.total_good} | BAD: {checker.total_bad} | ERRORS: {checker.total_errors} | BLOCKED: {len(checker.manual_review_sites)}")
+
         # Small delay between properties to avoid rate limits
         time.sleep(1)
 
-    # Save all results at the end
+    # Add summary and blocked sites at the end
+    checker._update_sheet_summary()
     checker.save_results()
 
 
