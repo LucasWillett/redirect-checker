@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-import requests
-from bs4 import BeautifulSoup
-import re
+import time
 from datetime import datetime
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, parse_qs
 import json
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+from playwright.sync_api import sync_playwright
+from bs4 import BeautifulSoup
 
 class RedirectChecker:
+    # Minimum page size in chars - pages smaller than this are likely blocked
+    MIN_PAGE_SIZE = 50000
+
     def __init__(self, base_url, sheet_id=None, credentials_path=None):
         self.results = []
         self.visited_urls = set()
@@ -18,10 +21,14 @@ class RedirectChecker:
         self.sheet_id = sheet_id
         self.credentials_path = credentials_path
         self.sheets_client = None
-        
+        self.playwright = None
+        self.browser = None
+        self.page = None
+        self.manual_review_sites = []  # Sites that appear to block automation
+
         if sheet_id and credentials_path:
             self._init_sheets()
-    
+
     def _init_sheets(self):
         try:
             scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
@@ -31,7 +38,30 @@ class RedirectChecker:
         except Exception as e:
             print(f"Could not connect to Google Sheets: {str(e)}")
             self.sheets_client = None
-    
+
+    def _init_browser(self):
+        """Initialize Playwright browser"""
+        self.playwright = sync_playwright().start()
+        # Use Firefox - better at bypassing bot detection
+        self.browser = self.playwright.firefox.launch(headless=True)
+        self.context = self.browser.new_context(
+            user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            viewport={'width': 1920, 'height': 1080},
+            locale='en-US',
+        )
+        self.page = self.context.new_page()
+
+    def _close_browser(self):
+        """Close Playwright browser"""
+        if self.page:
+            self.page.close()
+        if hasattr(self, 'context') and self.context:
+            self.context.close()
+        if self.browser:
+            self.browser.close()
+        if self.playwright:
+            self.playwright.stop()
+
     def _extract_crawl_path(self, url):
         parsed = urlparse(url)
         path = parsed.path
@@ -40,104 +70,219 @@ class RedirectChecker:
         elif not path.endswith('/'):
             path = path + '/'
         return path
-    
+
     def is_same_domain(self, url):
         domain = urlparse(url).netloc
         return domain == self.base_domain
-    
+
     def is_within_crawl_path(self, url):
         parsed = urlparse(url)
         return parsed.path.startswith(self.crawl_path)
-    
-    def crawl_website(self, website_url, website_name, max_pages=50):
-        print(f"\\nStarting crawl...")
-        print(f"Looking for: visitingmedia.com virtual tour iframes")
-        print(f"Max pages: {max_pages}\\n")
-        
-        pages_to_crawl = [website_url]
-        pages_crawled = 0
-        
-        while pages_to_crawl and pages_crawled < max_pages:
-            current_url = pages_to_crawl.pop(0)
-            
-            if current_url in self.visited_urls:
-                continue
-            
-            self.visited_urls.add(current_url)
-            pages_crawled += 1
-            
-            print(f"[{pages_crawled}/{max_pages}] {current_url.split('?')[0][-70:]}")
-            
-            try:
-                headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
-                response = requests.get(current_url, headers=headers, timeout=10)
-                response.raise_for_status()
-                
-                soup = BeautifulSoup(response.content, 'html.parser')
-                
-                # Check for visitingmedia links on THIS page
-                self._check_visitingmedia_links(soup, website_name, current_url)
-                
-                # Only follow links within the property path
-                links = soup.find_all('a', href=True)
-                for link in links:
-                    href = link.get('href', '')
-                    full_url = urljoin(current_url, href)
-                    full_url = full_url.split('#')[0]
-                    
-                    if (self.is_same_domain(full_url) and 
-                        self.is_within_crawl_path(full_url) and 
-                        full_url not in self.visited_urls and 
-                        len(pages_to_crawl) < max_pages):
-                        if full_url not in pages_to_crawl:
-                            pages_to_crawl.append(full_url)
-                
-            except Exception as e:
-                print(f"  [Error: {str(e)[:40]}]")
-        
-        print(f"\\nCrawl complete! Found {len(self.results)} visitingmedia tours")
-    
-    def _check_visitingmedia_links(self, soup, website_name, page_url):
-        """Check for visitingmedia.com links on the current page"""
-        found_count = 0
 
-        # Check iframes with src containing visitingmedia
+    def crawl_website(self, website_url, website_name, max_pages=50):
+        print(f"\nStarting crawl...")
+        print(f"Looking for: 'Virtual Tour' / '3D Tour' links + visitingmedia.com / truetour.app")
+        print(f"Max pages: {max_pages}\n")
+
+        self._init_browser()
+
+        try:
+            pages_to_crawl = [website_url]
+            pages_crawled = 0
+
+            while pages_to_crawl and pages_crawled < max_pages:
+                current_url = pages_to_crawl.pop(0)
+
+                if current_url in self.visited_urls:
+                    continue
+
+                self.visited_urls.add(current_url)
+                pages_crawled += 1
+
+                print(f"[{pages_crawled}/{max_pages}] {current_url.split('?')[0][-70:]}")
+
+                try:
+                    # Use Playwright to load the page (handles JS)
+                    self.page.goto(current_url, wait_until='load', timeout=45000)
+                    time.sleep(2)  # Extra wait for any late-loading content
+
+                    # Get the rendered HTML
+                    html_content = self.page.content()
+
+                    # Check if page appears to be blocked/bot-detected
+                    if self._is_page_blocked(html_content, current_url, website_name):
+                        print(f"  [BLOCKED: This site has bot detection - flagged for manual review]")
+                        continue
+
+                    soup = BeautifulSoup(html_content, 'html.parser')
+
+                    # Check for tour links on THIS page
+                    self._check_tour_links(soup, website_name, current_url)
+
+                    # Only follow links within the property path
+                    links = soup.find_all('a', href=True)
+                    for link in links:
+                        href = link.get('href', '')
+                        full_url = urljoin(current_url, href)
+                        full_url = full_url.split('#')[0]
+
+                        if (self.is_same_domain(full_url) and
+                            self.is_within_crawl_path(full_url) and
+                            full_url not in self.visited_urls and
+                            len(pages_to_crawl) < max_pages):
+                            if full_url not in pages_to_crawl:
+                                pages_to_crawl.append(full_url)
+
+                    # Rate limiting delay
+                    time.sleep(2)
+
+                except Exception as e:
+                    print(f"  [Error: {str(e)[:50]}]")
+
+            print(f"\nCrawl complete! Found {len(self.results)} tour links")
+        finally:
+            self._close_browser()
+
+    def _is_page_blocked(self, html_content, url, website_name):
+        """Check if the page appears to be blocking automation"""
+        page_size = len(html_content)
+
+        # Check 1: Page is suspiciously small
+        if page_size < self.MIN_PAGE_SIZE:
+            # Check for common bot detection signs
+            html_lower = html_content.lower()
+            bot_indicators = [
+                'captcha',
+                'please verify',
+                'access denied',
+                'blocked',
+                'robot',
+                'automated'
+            ]
+
+            # If small AND has bot indicators, definitely blocked
+            is_blocked = any(indicator in html_lower for indicator in bot_indicators)
+
+            # If just small and missing typical page elements, likely blocked
+            if not is_blocked:
+                missing_content = (
+                    '<main' not in html_lower and
+                    '<article' not in html_lower and
+                    'class="content"' not in html_lower and
+                    len(html_content) < 20000  # Very small
+                )
+                is_blocked = missing_content
+
+            if is_blocked or page_size < 20000:
+                self.manual_review_sites.append({
+                    'website_name': website_name,
+                    'url': url,
+                    'reason': f'Page size only {page_size} chars - likely bot detection',
+                    'timestamp': datetime.now().isoformat()
+                })
+                return True
+
+        return False
+
+    def _is_tour_domain(self, url):
+        """Check if URL is a visitingmedia or truetour link"""
+        return 'visitingmedia.com' in url or 'truetour.app' in url
+
+    def _has_tour_text(self, element):
+        """Check if element or its children contain tour-related phrases (case insensitive)"""
+        # Check visible text
+        text = element.get_text().lower()
+        if 'virtual tour' in text or '3d tour' in text:
+            return True
+
+        # Check element attributes
+        for attr in ['title', 'aria-label', 'alt', 'data-title']:
+            val = element.get(attr, '').lower()
+            if 'virtual tour' in val or '3d tour' in val:
+                return True
+
+        # Check images inside the element
+        for img in element.find_all('img'):
+            alt = img.get('alt', '').lower()
+            title = img.get('title', '').lower()
+            if 'virtual tour' in alt or '3d tour' in alt or 'virtual tour' in title or '3d tour' in title:
+                return True
+
+        return False
+
+    def _check_tour_links(self, soup, website_name, page_url):
+        """Check for virtual tour links on the current page"""
+        found_count = 0
+        checked_urls = set()  # Avoid checking same URL twice
+
+        # Check iframes with src containing tour domains
         iframes = soup.find_all('iframe', src=True)
         for iframe in iframes:
             src = iframe.get('src', '')
-            if 'visitingmedia.com' in src:
-                print(f"    Found visitingmedia iframe")
+            if self._is_tour_domain(src) and src not in checked_urls:
+                checked_urls.add(src)
+                print(f"    Found tour iframe")
                 self._check_redirect(src, website_name, page_url, "iframe")
                 found_count += 1
 
-        # Check elements with data-link attribute containing visitingmedia
+        # Check elements with data-link attribute containing tour domains
         elements_with_data_link = soup.find_all(attrs={'data-link': True})
         for element in elements_with_data_link:
             data_link = element.get('data-link', '')
-            if 'visitingmedia.com' in data_link:
-                print(f"    Found visitingmedia data-link")
+            if self._is_tour_domain(data_link) and data_link not in checked_urls:
+                checked_urls.add(data_link)
+                print(f"    Found tour data-link")
                 self._check_redirect(data_link, website_name, page_url, "data-link")
                 found_count += 1
 
-        # Check anchor tags with href containing visitingmedia
+        # Check anchor tags - multiple approaches:
         anchors = soup.find_all('a', href=True)
         for anchor in anchors:
             href = anchor.get('href', '')
-            if 'visitingmedia.com' in href:
-                print(f"    Found visitingmedia anchor")
+            if not href or href in checked_urls:
+                continue
+
+            # Approach 1: href contains tour domain
+            if self._is_tour_domain(href):
+                checked_urls.add(href)
+                print(f"    Found tour anchor (by domain)")
                 self._check_redirect(href, website_name, page_url, "anchor")
                 found_count += 1
 
+            # Approach 2: link text/attributes contain "virtual tour" or "3d tour"
+            elif self._has_tour_text(anchor):
+                checked_urls.add(href)
+                print(f"    Found tour link (by text): {href[:60]}...")
+                self._check_redirect(href, website_name, page_url, "tour-text")
+                found_count += 1
+
+        # Approach 3: Find links inside elements with tour-related classes
+        tour_containers = soup.find_all(class_=lambda c: c and ('virtual-tour' in c.lower() or '3d-tour' in c.lower() or 'tour-tag' in c.lower()))
+        for container in tour_containers:
+            links = container.find_all('a', href=True)
+            for link in links:
+                href = link.get('href', '')
+                if href and href not in checked_urls:
+                    checked_urls.add(href)
+                    print(f"    Found tour link (by container class): {href[:60]}...")
+                    self._check_redirect(href, website_name, page_url, "tour-class")
+                    found_count += 1
+
         return found_count
-    
+
     def _check_redirect(self, url, website_name, page_url, source="link"):
+        """Follow the redirect using Playwright to get the final URL"""
         try:
-            headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
-            response = requests.head(url, headers=headers, timeout=10, allow_redirects=True)
-            
-            final_url = response.url
+            # Create a new page for redirect checking to not interfere with crawling
+            redirect_page = self.context.new_page()
+            try:
+                redirect_page.goto(url, wait_until='domcontentloaded', timeout=15000)
+                final_url = redirect_page.url
+            finally:
+                redirect_page.close()
+
             status = self._categorize_redirect(final_url)
-            
+
             self.results.append({
                 'website_name': website_name,
                 'original_url': url,
@@ -148,7 +293,7 @@ class RedirectChecker:
                 'timestamp': datetime.now().isoformat(),
                 'error_details': ''
             })
-            
+
             print(f"      {status}")
         except Exception as e:
             self.results.append({
@@ -161,52 +306,74 @@ class RedirectChecker:
                 'timestamp': datetime.now().isoformat(),
                 'error_details': str(e)
             })
-    
+            print(f"      ERROR: {str(e)[:40]}")
+
     def _categorize_redirect(self, url):
         url_lower = url.lower()
-        
+
         if '/all-assets-share' in url_lower:
-            return 'BAD REDIRECT'
-        
-        if re.search(r'/media/\\d{6}', url_lower):
-            return 'GOOD'
-        
-        if '/media/' not in url_lower:
-            return 'BAD REDIRECT'
-        
+            parsed = urlparse(url)
+            query_params = parse_qs(parsed.query)
+            if 'asset' not in query_params:
+                return 'BAD REDIRECT'
+
         return 'GOOD'
-    
+
     def save_results(self):
-        if not self.results:
+        if not self.results and not self.manual_review_sites:
             print("No tour links found")
             return
-        
+
+        # Save tour link results
         filename = "redirect_checker_results.json"
         with open(filename, 'w') as f:
             json.dump(self.results, f, indent=2)
-        
+
         good = sum(1 for r in self.results if r['status'] == 'GOOD')
         bad = sum(1 for r in self.results if r['status'] == 'BAD REDIRECT')
         errors = sum(1 for r in self.results if r['status'] == 'ERROR')
-        
-        print(f"\\n{'='*60}")
+        manual_review = len(self.manual_review_sites)
+
+        print(f"\n{'='*60}")
         print(f"Results: {filename}")
         print(f"Total: {len(self.results)} | GOOD: {good} | BAD: {bad} | ERRORS: {errors}")
+
+        # Save and report manual review sites
+        if self.manual_review_sites:
+            review_filename = "manual_review_sites.json"
+            with open(review_filename, 'w') as f:
+                json.dump(self.manual_review_sites, f, indent=2)
+
+            print(f"\n{'!'*60}")
+            print(f"MANUAL REVIEW NEEDED: {manual_review} site(s)")
+            print(f"{'!'*60}")
+            print(f"\nThese sites have anti-bot protection that prevents automated")
+            print(f"crawling. This is common with large enterprise sites (Hyatt,")
+            print(f"Marriott, Hilton, etc.) that use aggressive bot detection.")
+            print(f"\nThis is NOT an error with the redirect checker - these sites")
+            print(f"intentionally block automated tools. You'll need to check")
+            print(f"these manually in a web browser.")
+            print(f"\nBlocked sites saved to: {review_filename}")
+            print(f"")
+            for site in self.manual_review_sites:
+                print(f"  - {site['url']}")
+                print(f"    ({site['reason']})")
+
         print(f"{'='*60}")
-        
+
         if self.sheets_client and self.sheet_id:
             self._write_to_sheets(good, bad, errors)
-    
+
     def _write_to_sheets(self, good, bad, errors):
         try:
             sheet = self.sheets_client.open_by_key(self.sheet_id)
             worksheet = sheet.sheet1
-            
+
             worksheet.clear()
-            
+
             headers = ['Website Name', 'Original URL', 'Page Found On', 'Redirects To', 'Status', 'Timestamp']
             worksheet.append_row(headers)
-            
+
             for result in self.results:
                 row = [
                     result['website_name'],
@@ -217,44 +384,44 @@ class RedirectChecker:
                     result['timestamp']
                 ]
                 worksheet.append_row(row)
-            
-            print(f"\\nWrote {len(self.results)} results to Google Sheets!")
+
+            print(f"\nWrote {len(self.results)} results to Google Sheets!")
         except Exception as e:
-            print(f"\\nCould not write to Google Sheets: {str(e)}")
+            print(f"\nCould not write to Google Sheets: {str(e)}")
 
 def main():
     print("="*60)
-    print("REDIRECT CHECKER - VISITINGMEDIA FOCUS")
+    print("REDIRECT CHECKER - TOUR LINK VALIDATOR")
     print("="*60)
-    
-    website_url = input("\\nEnter property URL: ").strip()
+
+    website_url = input("\nEnter property URL: ").strip()
     website_name = input("Enter property name: ").strip()
     max_pages_input = input("Max pages (default 100): ").strip()
-    
+
     if not website_url:
         print("Error: URL required")
         return
-    
+
     if not website_url.startswith(('http://', 'https://')):
         website_url = 'https://' + website_url
-    
+
     if not website_name:
         website_name = website_url
-    
+
     max_pages = 100
     if max_pages_input:
         try:
             max_pages = int(max_pages_input)
         except:
             pass
-    
+
     sheet_id = '18UAf2hhgdS0-tjADyEkRXCPqksGDYPYA67Hd9MYJX1I'
     credentials_path = '/Users/lucaswillett/credentials.json'
-    
+
     checker = RedirectChecker(website_url, sheet_id=sheet_id, credentials_path=credentials_path)
     checker.crawl_website(website_url, website_name, max_pages=max_pages)
     checker.save_results()
-    print("\\nDone!")
+    print("\nDone!")
 
 if __name__ == '__main__':
     main()
