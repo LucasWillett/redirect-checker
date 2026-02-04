@@ -239,7 +239,14 @@ class RedirectChecker:
         anchors = soup.find_all('a', href=True)
         for anchor in anchors:
             href = anchor.get('href', '')
-            if not href or href in checked_urls:
+            if not href or href.startswith('#') or href.startswith('javascript:'):
+                continue
+
+            # Convert relative URLs to absolute
+            if not href.startswith(('http://', 'https://')):
+                href = urljoin(page_url, href)
+
+            if href in checked_urls:
                 continue
 
             # Approach 1: href contains tour domain
@@ -371,10 +378,13 @@ class RedirectChecker:
 
             worksheet.clear()
 
+            # Only write BAD REDIRECT and ERROR results - no need to show working links
+            problem_results = [r for r in self.results if r['status'] in ['BAD REDIRECT', 'ERROR']]
+
             headers = ['Website Name', 'Original URL', 'Page Found On', 'Redirects To', 'Status', 'Timestamp']
             worksheet.append_row(headers)
 
-            for result in self.results:
+            for result in problem_results:
                 row = [
                     result['website_name'],
                     result['original_url'],
@@ -385,7 +395,22 @@ class RedirectChecker:
                 ]
                 worksheet.append_row(row)
 
-            print(f"\nWrote {len(self.results)} results to Google Sheets!")
+            # Add manual review sites at the bottom
+            if self.manual_review_sites:
+                worksheet.append_row([])  # Empty row separator
+                worksheet.append_row(['--- BLOCKED SITES (Manual Review Needed) ---', '', '', '', '', ''])
+                for site in self.manual_review_sites:
+                    worksheet.append_row([
+                        site['website_name'],
+                        site['url'],
+                        '',
+                        '',
+                        'BLOCKED',
+                        site['timestamp']
+                    ])
+
+            total_problems = len(problem_results) + len(self.manual_review_sites)
+            print(f"\nWrote {total_problems} problem links to Google Sheets (BAD: {bad}, ERRORS: {errors}, BLOCKED: {len(self.manual_review_sites)})")
         except Exception as e:
             print(f"\nCould not write to Google Sheets: {str(e)}")
 
