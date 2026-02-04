@@ -391,12 +391,21 @@ class RedirectChecker:
             print(f"      ERROR: {str(e)[:40]}")
 
     def _categorize_redirect(self, url):
+        """Categorize redirect as GOOD or BAD.
+
+        BAD REDIRECT: /all-assets-share with no deep-link parameter
+        GOOD: Everything else (including /all-assets-share with asset= or shareId=)
+        """
         url_lower = url.lower()
 
         if '/all-assets-share' in url_lower:
             parsed = urlparse(url)
             query_params = parse_qs(parsed.query)
-            if 'asset' not in query_params:
+            # Check for deep-link parameters that indicate a specific asset
+            has_deep_link = ('asset' in query_params or
+                           'shareId' in query_params or
+                           'shareid' in query_params)
+            if not has_deep_link:
                 return 'BAD REDIRECT'
 
         return 'GOOD'
