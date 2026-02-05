@@ -45,19 +45,25 @@ class RedirectChecker:
             print(f"Could not connect to Google Sheets: {str(e)}")
             self.sheets_client = None
 
-    def _init_output_sheet(self):
+    def _init_output_sheet(self, clear_sheet=True):
         """Initialize output sheet with headers for incremental writing"""
         if not self.sheets_client or not self.sheet_id:
             return
         try:
             sheet = self.sheets_client.open_by_key(self.sheet_id)
             self.worksheet = sheet.sheet1
-            self.worksheet.clear()
-            # Write headers
-            headers = ['Property Name', 'Original URL', 'Page Found On', 'Redirects To', 'Status', 'Timestamp']
-            self.worksheet.append_row(headers)
-            self.last_sheet_row = 2
-            print("Output sheet initialized")
+            if clear_sheet:
+                self.worksheet.clear()
+                # Write headers
+                headers = ['Property Name', 'Original URL', 'Page Found On', 'Redirects To', 'Status', 'Timestamp']
+                self.worksheet.append_row(headers)
+                self.last_sheet_row = 2
+                print("Output sheet initialized")
+            else:
+                # Resuming - find last row
+                all_values = self.worksheet.get_all_values()
+                self.last_sheet_row = len(all_values) + 1
+                print(f"Resuming - appending after row {self.last_sheet_row - 1}")
         except Exception as e:
             print(f"Could not initialize output sheet: {str(e)}")
 
@@ -413,6 +419,19 @@ class RedirectChecker:
 
         return 'GOOD'
 
+    def _save_results_incremental(self):
+        """Save results to JSON after each property to prevent data loss"""
+        try:
+            filename = "redirect_checker_results.json"
+            with open(filename, 'w') as f:
+                json.dump(self.results, f, indent=2)
+            # Also save manual review sites
+            if self.manual_review_sites:
+                with open("manual_review_sites.json", 'w') as f:
+                    json.dump(self.manual_review_sites, f, indent=2)
+        except Exception as e:
+            print(f"  [Warning: Could not save incremental results: {str(e)}]")
+
     def save_results(self):
         if not self.results and not self.manual_review_sites:
             print("No tour links found")
@@ -542,6 +561,7 @@ def run_batch_mode(credentials_path, input_sheet_id, output_sheet_id, max_pages=
         start_row: Row number to start from (1-indexed, after header)
         row_limit: Max number of properties to process (None = all)
     """
+    is_resume = start_row > 1
     print("\nBatch mode: Reading properties from Google Sheet...")
 
     # Connect to Google Sheets
@@ -580,8 +600,8 @@ def run_batch_mode(credentials_path, input_sheet_id, output_sheet_id, max_pages=
     # Use a dummy base_url since we'll be processing multiple
     checker = RedirectChecker("https://example.com", sheet_id=output_sheet_id, credentials_path=credentials_path)
 
-    # Initialize output sheet with headers
-    checker._init_output_sheet()
+    # Initialize output sheet with headers (don't clear if resuming)
+    checker._init_output_sheet(clear_sheet=not is_resume)
 
     # Process each property
     for i, row in enumerate(data_rows):
@@ -635,6 +655,9 @@ def run_batch_mode(credentials_path, input_sheet_id, output_sheet_id, max_pages=
         # Append any problems to sheet immediately
         checker._append_to_sheet(new_results)
 
+        # Save JSON incrementally to prevent data loss on crash
+        checker._save_results_incremental()
+
         # Print running totals
         print(f"  >> Running totals: {checker.properties_processed} properties | GOOD: {checker.total_good} | BAD: {checker.total_bad} | ERRORS: {checker.total_errors} | BLOCKED: {len(checker.manual_review_sites)}")
 
@@ -647,12 +670,26 @@ def run_batch_mode(credentials_path, input_sheet_id, output_sheet_id, max_pages=
 
 
 def main():
+    import sys
+
     print("="*60)
     print("REDIRECT CHECKER - TOUR LINK VALIDATOR")
     print("="*60)
 
     credentials_path = '/Users/lucaswillett/credentials.json'
     output_sheet_id = '18UAf2hhgdS0-tjADyEkRXCPqksGDYPYA67Hd9MYJX1I'
+    default_input_sheet = '1zZfUW4qonN21eSo6PeckzweRFlPSHo4CBznGcVpfWtA'
+
+    # Command line mode: python3 redirect_checker.py batch [start_row] [row_limit] [max_pages]
+    if len(sys.argv) > 1 and sys.argv[1] == 'batch':
+        start_row = int(sys.argv[2]) if len(sys.argv) > 2 else 1
+        row_limit = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3] != 'all' else None
+        max_pages = int(sys.argv[4]) if len(sys.argv) > 4 else 3
+
+        print(f"\nBatch mode (CLI): start={start_row}, limit={row_limit or 'all'}, max_pages={max_pages}")
+        run_batch_mode(credentials_path, default_input_sheet, output_sheet_id, max_pages, start_row, row_limit)
+        print("\nDone!")
+        return
 
     print("\nModes:")
     print("  1. Single URL (interactive)")
@@ -663,8 +700,7 @@ def main():
     if mode == '2':
         input_sheet_id = input("Enter input Google Sheet ID (or press Enter for default): ").strip()
         if not input_sheet_id:
-            # Default to the sheet the user mentioned
-            input_sheet_id = '1zZfUW4qonN21eSo6PeckzweRFlPSHo4CBznGcVpfWtA'
+            input_sheet_id = default_input_sheet
 
         start_row_input = input("Start from row # (default 1): ").strip()
         start_row = 1
