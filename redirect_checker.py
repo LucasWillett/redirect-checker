@@ -144,12 +144,38 @@ class RedirectChecker:
             self.playwright.stop()
 
     def _extract_crawl_path(self, url):
+        """Extract crawl boundary from URL.
+
+        Smart parent detection:
+        - /rooms-and-cottages (1 segment) -> /rooms-and-cottages/ (stay here, children are under this)
+        - /weddings-social-events/event-spaces (2 segments) -> /weddings-social-events/ (go up, siblings exist)
+
+        This handles both patterns:
+        1. Top-level sections where detail pages are children
+        2. Nested sections where detail pages are siblings of the starting page
+        """
         parsed = urlparse(url)
         path = parsed.path
-        if path.endswith('.html'):
-            path = path.rsplit('/', 1)[0] + '/'
-        elif not path.endswith('/'):
+
+        # Remove trailing slash for consistent handling
+        path = path.rstrip('/')
+
+        # Count path segments (ignore empty strings from leading slash)
+        segments = [s for s in path.split('/') if s]
+
+        # Only go up one level if there are 2+ segments
+        # This prevents /rooms-and-cottages from becoming / (too broad)
+        if len(segments) >= 2:
+            path = '/' + '/'.join(segments[:-1])
+
+        # Ensure trailing slash
+        if path and not path.endswith('/'):
             path = path + '/'
+
+        # If we end up at root, use root
+        if not path:
+            path = '/'
+
         return path
 
     def is_same_domain(self, url):
@@ -160,18 +186,24 @@ class RedirectChecker:
         parsed = urlparse(url)
         return parsed.path.startswith(self.crawl_path)
 
-    def crawl_website(self, website_url, website_name, max_pages=50):
+    def crawl_website(self, website_url, website_name, max_pages=100):
         print(f"\nStarting crawl...")
         print(f"Looking for: 'Virtual Tour' / '3D Tour' links + visitingmedia.com / truetour.app")
-        print(f"Max pages: {max_pages}\n")
+        print(f"Max pages: {max_pages} (auto-expands if needed)\n")
 
         self._init_browser()
+
+        # Track when tours are found for auto-expansion
+        HARD_CAP = 500
+        EXPANSION_INCREMENT = 50
+        last_tour_found_at = 0
+        current_limit = max_pages
 
         try:
             pages_to_crawl = [website_url]
             pages_crawled = 0
 
-            while pages_to_crawl and pages_crawled < max_pages:
+            while pages_to_crawl and pages_crawled < current_limit:
                 current_url = pages_to_crawl.pop(0)
 
                 if current_url in self.visited_urls:
@@ -198,7 +230,20 @@ class RedirectChecker:
                     soup = BeautifulSoup(html_content, 'html.parser')
 
                     # Check for tour links on THIS page
+                    tours_before = len(self.results)
                     self._check_tour_links(soup, website_name, current_url)
+                    tours_after = len(self.results)
+
+                    # Track if we found tours on this page
+                    if tours_after > tours_before:
+                        last_tour_found_at = pages_crawled
+
+                    # Auto-expand if finding tours near the limit
+                    if pages_crawled >= current_limit - 5 and last_tour_found_at >= current_limit - (current_limit // 10):
+                        if current_limit < HARD_CAP:
+                            old_limit = current_limit
+                            current_limit = min(current_limit + EXPANSION_INCREMENT, HARD_CAP)
+                            print(f"  [Auto-expanding: tours found recently, increasing limit {old_limit} -> {current_limit}]")
 
                     # Only follow links within the property path
                     links = soup.find_all('a', href=True)
@@ -220,7 +265,10 @@ class RedirectChecker:
                 except Exception as e:
                     print(f"  [Error: {str(e)[:50]}]")
 
-            print(f"\nCrawl complete! Found {len(self.results)} tour links")
+            if current_limit > max_pages:
+                print(f"\nCrawl complete! Found {len(self.results)} tour links (auto-expanded to {current_limit} pages)")
+            else:
+                print(f"\nCrawl complete! Found {len(self.results)} tour links")
         finally:
             self._close_browser()
 
